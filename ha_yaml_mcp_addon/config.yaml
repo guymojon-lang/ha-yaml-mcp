@@ -1,4 +1,4 @@
-name: "HA YAML MCP (local prototype)"
+name: "HA YAML MCP (Read-Only)"
 version: "0.1.1"
 slug: "ha_yaml_mcp"
 description: "Local read-only MCP prototype for selected Home Assistant YAML files"
