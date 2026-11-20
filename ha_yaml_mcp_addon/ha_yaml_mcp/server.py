@@ -18,7 +18,12 @@ TOKEN = os.environ.get('HA_YAML_MCP_TOKEN', '')
 if len(TOKEN) < 32:
     raise RuntimeError('HA_YAML_MCP_TOKEN must be at least 32 characters')
 
-mcp = FastMCP('Home Assistant YAML (read-only)', stateless_http=True, json_response=True)
+mcp = FastMCP(
+    'Home Assistant YAML (read-only)',
+    stateless_http=True,
+    json_response=True,
+    host='0.0.0.0',
+)
 
 
 def allowed_path(filename: str) -> Path:
