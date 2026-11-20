@@ -1,11 +1,15 @@
 name: "HA YAML MCP (Read-Only)"
-version: "0.1.1"
+version: "0.1.2"
 slug: "ha_yaml_mcp"
 description: "Local read-only MCP prototype for selected Home Assistant YAML files"
 url: "https://github.com/guymojon-lang/ha-yaml-mcp"
 startup: "application"
 boot: "manual"
 init: false
+ports:
+  8765/tcp: null
+ports_description:
+  8765/tcp: "MCP server (local access)"
 arch:
   - amd64
   - aarch64
