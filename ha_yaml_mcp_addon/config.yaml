@@ -1,0 +1,16 @@
+name: "HA YAML MCP (local prototype)"
+version: "0.1.0"
+slug: "ha_yaml_mcp"
+description: "Local read-only MCP prototype for selected Home Assistant YAML files"
+url: "https://github.com/guymojon-lang/ha-yaml-mcp"
+startup: "application"
+boot: "manual"
+init: false
+arch:
+  - amd64
+  - aarch64
+map:
+  - type: homeassistant_config
+    read_only: true
+options: {}
+schema: {}
