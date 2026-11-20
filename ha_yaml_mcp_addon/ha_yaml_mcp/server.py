@@ -56,7 +56,7 @@ class TokenMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-app = Starlette(routes=[Mount('/mcp', app=mcp.streamable_http_app())])
+app = mcp.streamable_http_app()
 app.add_middleware(TokenMiddleware)
 
 if __name__ == '__main__':
