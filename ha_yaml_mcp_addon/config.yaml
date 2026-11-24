@@ -1,11 +1,12 @@
 name: "HA YAML MCP (Read-Only)"
-version: "0.1.7"
+version: "0.1.8"
 slug: "ha_yaml_mcp"
-description: "Read-only MCP access to Home Assistant YAML, dashboards and template helpers"
+description: "Read-only MCP access to Home Assistant YAML, dashboards, template helpers and entity history"
 url: "https://github.com/guymojon-lang/ha-yaml-mcp"
 startup: "application"
 boot: "manual"
 init: false
+homeassistant_api: true
 ports:
   8765/tcp: null
 ports_description:
