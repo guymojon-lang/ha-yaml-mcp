@@ -2,6 +2,9 @@ import os
 import json
 import secrets
 import re
+import hashlib
+import difflib
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -15,6 +18,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 CONFIG = Path(os.environ.get("HA_CONFIG_DIR", "/homeassistant")).resolve()
+
+CHANGE_DIR = Path("/data/automation_changes")
+MAX_PROPOSALS = 100
+MAX_CONFIG_BYTES = 1024 * 1024
+MAX_RECORD_BYTES = 16 * 1024 * 1024
+CHANGE_LOCK = threading.Lock()
 
 ALLOWED = frozenset({
     "configuration.yaml",
@@ -472,6 +481,433 @@ def get_automation_config(automation_id: str) -> dict:
 
     if not isinstance(result, dict):
         raise RuntimeError("Unexpected automation configuration response")
+
+    return result
+
+
+def canonical_config(config: dict) -> bytes:
+    return json.dumps(
+        config,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def config_fingerprint(config: dict) -> str:
+    return hashlib.sha256(
+        canonical_config(config)
+    ).hexdigest()
+
+
+def readable_config(config: dict) -> str:
+    return json.dumps(
+        config,
+        sort_keys=True,
+        ensure_ascii=False,
+        indent=2,
+        allow_nan=False,
+    )
+
+
+def ensure_change_directory() -> Path:
+    if CHANGE_DIR.is_symlink():
+        raise RuntimeError("Unsafe proposal storage directory")
+
+    CHANGE_DIR.mkdir(
+        mode=0o700,
+        parents=True,
+        exist_ok=True,
+    )
+
+    if not CHANGE_DIR.is_dir():
+        raise RuntimeError("Proposal storage unavailable")
+
+    if CHANGE_DIR.resolve().parent != Path("/data").resolve():
+        raise RuntimeError("Unsafe proposal storage location")
+
+    CHANGE_DIR.chmod(0o700)
+
+    return CHANGE_DIR
+
+
+def validate_proposed_config(
+    automation_id: str,
+    proposed_config: dict,
+) -> dict:
+    """
+    Perform basic structural checks only.
+
+    This is not native Home Assistant schema validation.
+    """
+
+    if not isinstance(proposed_config, dict):
+        raise ValueError("Proposed configuration must be an object")
+
+    if len(canonical_config(proposed_config)) > MAX_CONFIG_BYTES:
+        raise ValueError("Proposed configuration too large")
+
+    proposed = json.loads(
+        canonical_config(proposed_config).decode("utf-8")
+    )
+
+    if "id" in proposed:
+        if str(proposed["id"]) != automation_id:
+            raise ValueError("Automation ID cannot be changed")
+
+    proposed["id"] = automation_id
+
+    alias = proposed.get("alias")
+
+    if not isinstance(alias, str) or not alias.strip():
+        raise ValueError("A non-empty automation alias is required")
+
+    for singular, plural in (
+        ("trigger", "triggers"),
+        ("condition", "conditions"),
+        ("action", "actions"),
+    ):
+        if singular in proposed and plural in proposed:
+            raise ValueError(
+                f"Do not supply both {singular} and {plural}"
+            )
+
+    triggers = proposed.get(
+        "triggers",
+        proposed.get("trigger"),
+    )
+
+    actions = proposed.get(
+        "actions",
+        proposed.get("action"),
+    )
+
+    conditions = proposed.get(
+        "conditions",
+        proposed.get("condition", []),
+    )
+
+    if not isinstance(triggers, list):
+        raise ValueError("Triggers must be supplied as a list")
+
+    if not isinstance(actions, list) or not actions:
+        raise ValueError("A non-empty actions list is required")
+
+    if not isinstance(conditions, list):
+        raise ValueError("Conditions must be supplied as a list")
+
+    for section in (triggers, actions, conditions):
+        if not all(isinstance(item, dict) for item in section):
+            raise ValueError(
+                "Trigger, condition and action entries must be objects"
+            )
+
+    mode = proposed.get("mode", "single")
+
+    if mode not in {"single", "restart", "queued", "parallel"}:
+        raise ValueError("Invalid automation mode")
+
+    if len(canonical_config(proposed)) > MAX_CONFIG_BYTES:
+        raise ValueError("Proposed configuration too large")
+
+    return proposed
+
+
+def make_config_diff(
+    original: dict,
+    proposed: dict,
+) -> str:
+    return "\n".join(
+        difflib.unified_diff(
+            readable_config(original).splitlines(),
+            readable_config(proposed).splitlines(),
+            fromfile="current_configuration",
+            tofile="proposed_configuration",
+            lineterm="",
+        )
+    )
+
+
+def store_change(record: dict) -> None:
+    directory = ensure_change_directory()
+
+    change_id = record["change_id"]
+
+    if not re.fullmatch(r"[a-f0-9]{32}", change_id):
+        raise ValueError("Invalid change reference")
+
+    destination = directory / f"{change_id}.json"
+
+    payload = json.dumps(
+        record,
+        ensure_ascii=False,
+        indent=2,
+        allow_nan=False,
+    ).encode("utf-8")
+
+    if len(payload) > MAX_RECORD_BYTES:
+        raise ValueError("Proposal record too large")
+
+    with CHANGE_LOCK:
+        existing = list(directory.glob("*.json"))
+
+        if len(existing) >= MAX_PROPOSALS:
+            raise RuntimeError(
+                "Proposal storage limit reached. "
+                "No existing backups have been deleted."
+            )
+
+        temporary = directory / (
+            f".{change_id}.{secrets.token_hex(8)}.tmp"
+        )
+
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+        )
+
+        try:
+            fd = os.open(temporary, flags, 0o600)
+
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            os.link(temporary, destination)
+
+            directory_fd = os.open(
+                directory,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def load_change(change_id: str) -> dict:
+    if not re.fullmatch(r"[a-f0-9]{32}", change_id):
+        raise ValueError("Invalid change reference")
+
+    directory = ensure_change_directory()
+
+    path = safe_file(
+        directory,
+        f"{change_id}.json",
+        frozenset({f"{change_id}.json"}),
+    )
+
+    if path.stat().st_size > MAX_RECORD_BYTES:
+        raise ValueError("Proposal record too large")
+
+    record = json.loads(
+        path.read_text(encoding="utf-8")
+    )
+
+    if not isinstance(record, dict):
+        raise RuntimeError("Invalid proposal record")
+
+    if record.get("change_id") != change_id:
+        raise RuntimeError("Proposal reference mismatch")
+
+    if record.get("schema_version") != 1:
+        raise RuntimeError("Unsupported proposal record version")
+
+    if record.get("status") != "prepared_only":
+        raise RuntimeError("Unexpected proposal status")
+
+    original = record.get("original_config")
+    proposed = record.get("proposed_config")
+
+    if not isinstance(original, dict):
+        raise RuntimeError("Original configuration missing")
+
+    if not isinstance(proposed, dict):
+        raise RuntimeError("Proposed configuration missing")
+
+    if config_fingerprint(original) != record.get(
+        "original_fingerprint"
+    ):
+        raise RuntimeError("Original configuration integrity check failed")
+
+    if config_fingerprint(proposed) != record.get(
+        "proposed_fingerprint"
+    ):
+        raise RuntimeError("Proposed configuration integrity check failed")
+
+    return record
+
+
+@mcp.tool()
+def prepare_automation_change(
+    automation_id: str,
+    proposed_config: dict,
+    reason: str,
+) -> dict:
+    """
+    Prepare a proposed replacement for an existing automation.
+
+    Supply the complete proposed automation configuration,
+    not a partial patch, and a reason for the change.
+
+    Retrieves the original through the native Home Assistant API,
+    performs basic structural checks, calculates fingerprints,
+    generates a comparison and stores both configurations in
+    persistent app storage.
+
+    Does not modify, reload, execute or delete any automation.
+
+    Native Home Assistant schema validation is not performed.
+    A prepared proposal is not an approved change.
+    """
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", automation_id):
+        raise ValueError("Invalid automation configuration ID")
+
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("A reason for the proposed change is required")
+
+    if len(reason) > 2000:
+        raise ValueError("Change reason too long")
+
+    proposed = validate_proposed_config(
+        automation_id,
+        proposed_config,
+    )
+
+    original = get_automation_config(automation_id)
+
+    if str(original.get("id", "")) != automation_id:
+        raise RuntimeError("Original automation ID mismatch")
+
+    original_hash = config_fingerprint(original)
+    proposed_hash = config_fingerprint(proposed)
+
+    if original_hash == proposed_hash:
+        return {
+            "status": "no_changes",
+            "automation_id": automation_id,
+            "alias": original.get("alias"),
+            "live_configuration_modified": False,
+        }
+
+    comparison = make_config_diff(
+        original,
+        proposed,
+    )
+
+    change_id = secrets.token_hex(16)
+
+    record = {
+        "schema_version": 1,
+        "change_id": change_id,
+        "automation_id": automation_id,
+        "alias": original.get("alias"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "reason": reason.strip(),
+        "status": "prepared_only",
+        "approved": False,
+        "native_validation_performed": False,
+        "original_fingerprint": original_hash,
+        "proposed_fingerprint": proposed_hash,
+        "original_config": original,
+        "proposed_config": proposed,
+        "diff": comparison,
+    }
+
+    store_change(record)
+
+    return {
+        "status": "prepared_only",
+        "change_id": change_id,
+        "automation_id": automation_id,
+        "alias": original.get("alias"),
+        "created_at": record["created_at"],
+        "reason": record["reason"],
+        "original_fingerprint": original_hash,
+        "proposed_fingerprint": proposed_hash,
+        "backup_stored": True,
+        "structural_checks_passed": True,
+        "native_validation_performed": False,
+        "approved": False,
+        "live_configuration_modified": False,
+        "diff": comparison,
+    }
+
+
+@mcp.tool()
+def review_automation_change(
+    change_id: str,
+) -> dict:
+    """
+    Review a previously prepared automation change.
+
+    Returns the original and proposed configurations,
+    fingerprints, comparison and backup information.
+
+    Also retrieves the current live configuration and
+    checks whether it has changed since preparation.
+
+    Does not approve, apply, modify or execute anything.
+    """
+
+    record = load_change(change_id)
+
+    original = record["original_config"]
+    proposed = record["proposed_config"]
+
+    comparison = make_config_diff(
+        original,
+        proposed,
+    )
+
+    result = {
+        "status": "prepared_only",
+        "change_id": record["change_id"],
+        "automation_id": record["automation_id"],
+        "alias": record.get("alias"),
+        "created_at": record["created_at"],
+        "reason": record["reason"],
+        "approved": False,
+        "native_validation_performed": False,
+        "backup_integrity_verified": True,
+        "original_fingerprint": record["original_fingerprint"],
+        "proposed_fingerprint": record["proposed_fingerprint"],
+        "original_config": original,
+        "proposed_config": proposed,
+        "diff": comparison,
+        "live_configuration_modified": False,
+    }
+
+    try:
+        current = get_automation_config(
+            record["automation_id"]
+        )
+
+        current_hash = config_fingerprint(current)
+
+        result["current_fingerprint"] = current_hash
+        result["conflict_detected"] = (
+            current_hash != record["original_fingerprint"]
+        )
+
+        result["live_check_completed"] = True
+
+    except Exception:
+        result["live_check_completed"] = False
+        result["conflict_detected"] = None
+        result["warning"] = (
+            "Unable to verify the current live configuration. "
+            "Do not treat this proposal as safe to apply."
+        )
 
     return result
 
