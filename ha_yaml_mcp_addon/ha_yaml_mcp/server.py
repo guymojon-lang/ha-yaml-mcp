@@ -1199,9 +1199,9 @@ def native_validate(config):
 
     result = websocket_request({
         "type": "validate_config",
-        "trigger": config.get("triggers", []),
-        "condition": config.get("conditions", []),
-        "action": config.get("actions", []),
+        "triggers": config.get("triggers", []),
+        "conditions": config.get("conditions", []),
+        "actions": config.get("actions", []),
     })
 
     if not isinstance(result, dict):
@@ -1210,15 +1210,16 @@ def native_validate(config):
         )
 
     for section in (
-        "trigger",
-        "condition",
-        "action",
+        "triggers",
+        "conditions",
+        "actions",
     ):
         validation = result.get(section)
 
         if not isinstance(validation, dict):
             raise RuntimeError(
-                f"No validation result for {section}"
+                f"No validation result for {section}: "
+                + json.dumps(result)
             )
 
         if validation.get("valid") is not True:
