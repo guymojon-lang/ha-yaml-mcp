@@ -17,13 +17,24 @@ from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
-CONFIG = Path(os.environ.get("HA_CONFIG_DIR", "/homeassistant")).resolve()
+
+CONFIG = Path(
+    os.environ.get("HA_CONFIG_DIR", "/homeassistant")
+).resolve()
 
 CHANGE_DIR = Path("/data/automation_changes")
+APPROVAL_DIR = Path("/data/used_approvals")
+OPTIONS_FILE = Path("/data/options.json")
+
+TEST_AUTOMATION_ID = "1795528642010"
+
 MAX_PROPOSALS = 100
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_RECORD_BYTES = 16 * 1024 * 1024
+APPROVAL_MINUTES = 60
+
 CHANGE_LOCK = threading.Lock()
+EDIT_LOCK = threading.Lock()
 
 ALLOWED = frozenset({
     "configuration.yaml",
@@ -45,30 +56,50 @@ DASHBOARD_FILES = frozenset({
 })
 
 TOKEN = os.environ.get("HA_YAML_MCP_TOKEN", "")
+
 if len(TOKEN) < 32:
-    raise RuntimeError("HA_YAML_MCP_TOKEN must be at least 32 characters")
+    raise RuntimeError(
+        "HA_YAML_MCP_TOKEN must be at least 32 characters"
+    )
 
 mcp = FastMCP(
-    "Home Assistant YAML (read-only)",
+    "Home Assistant YAML",
     stateless_http=True,
     json_response=True,
     host="0.0.0.0",
 )
 
 
-def safe_file(directory: Path, filename: str, allowlist: frozenset) -> Path:
+def safe_file(directory, filename, allowlist):
     if filename not in allowlist:
-        raise ValueError("File is not on the read-only allowlist")
+        raise ValueError("File is not on the allowlist")
+
     p = directory / filename
+
     if p.is_symlink() or p.resolve().parent != directory:
         raise ValueError("Unsafe path")
+
     if not p.is_file():
         raise FileNotFoundError(filename)
+
     return p
+
+
+def supervisor_token():
+    token = os.environ.get("SUPERVISOR_TOKEN", "")
+
+    if not token:
+        raise RuntimeError(
+            "Home Assistant API access is unavailable"
+        )
+
+    return token
 
 
 @mcp.tool()
 def list_yaml_files() -> list[str]:
+    """List permitted Home Assistant YAML files."""
+
     return sorted(
         name for name in ALLOWED
         if (CONFIG / name).is_file()
@@ -78,15 +109,22 @@ def list_yaml_files() -> list[str]:
 
 @mcp.tool()
 def read_yaml_file(filename: str) -> str:
+    """Read an allowlisted Home Assistant YAML file."""
+
     p = safe_file(CONFIG, filename, ALLOWED)
-    if p.stat().st_size > 1024 * 1024:
+
+    if p.stat().st_size > MAX_CONFIG_BYTES:
         raise ValueError("File too large")
+
     return p.read_text(encoding="utf-8")
 
 
 @mcp.tool()
 def list_dashboards() -> list[str]:
+    """List permitted dashboard configuration files."""
+
     directory = CONFIG / ".storage"
+
     return sorted(
         name for name in DASHBOARD_FILES
         if (directory / name).is_file()
@@ -96,15 +134,25 @@ def list_dashboards() -> list[str]:
 
 @mcp.tool()
 def read_dashboard(filename: str) -> str:
+    """Read an allowlisted dashboard configuration."""
+
     directory = (CONFIG / ".storage").resolve()
-    p = safe_file(directory, filename, DASHBOARD_FILES)
-    if p.stat().st_size > 1024 * 1024:
+
+    p = safe_file(
+        directory,
+        filename,
+        DASHBOARD_FILES,
+    )
+
+    if p.stat().st_size > MAX_CONFIG_BYTES:
         raise ValueError("Dashboard file too large")
+
     return p.read_text(encoding="utf-8")
 
 
-def template_entries() -> list:
+def template_entries():
     directory = (CONFIG / ".storage").resolve()
+
     p = safe_file(
         directory,
         "core.config_entries",
@@ -112,9 +160,13 @@ def template_entries() -> list:
     )
 
     if p.stat().st_size > 16 * 1024 * 1024:
-        raise ValueError("Configuration entries file too large")
+        raise ValueError(
+            "Configuration entries file too large"
+        )
 
-    content = json.loads(p.read_text(encoding="utf-8"))
+    content = json.loads(
+        p.read_text(encoding="utf-8")
+    )
 
     return [
         entry
@@ -126,6 +178,7 @@ def template_entries() -> list:
 @mcp.tool()
 def list_template_helpers() -> list[dict]:
     """List UI-created Home Assistant template helpers."""
+
     return [
         {
             "entry_id": entry.get("entry_id"),
@@ -138,7 +191,8 @@ def list_template_helpers() -> list[dict]:
 
 @mcp.tool()
 def read_template_helper(entry_id: str) -> dict:
-    """Read the configuration and Jinja templates of a template helper."""
+    """Read configuration and Jinja templates of a helper."""
+
     for entry in template_entries():
         if entry.get("entry_id") == entry_id:
             return {
@@ -151,14 +205,20 @@ def read_template_helper(entry_id: str) -> dict:
     raise ValueError("Template helper not found")
 
 
-def parse_timestamp(value: str) -> datetime:
+def parse_timestamp(value):
     try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
     except ValueError:
-        raise ValueError("Use an ISO 8601 timestamp")
+        raise ValueError(
+            "Use an ISO 8601 timestamp"
+        ) from None
 
     if dt.tzinfo is None:
-        raise ValueError("Timestamp must include a timezone offset")
+        raise ValueError(
+            "Timestamp must include a timezone offset"
+        )
 
     return dt.astimezone(timezone.utc)
 
@@ -171,31 +231,29 @@ def get_entity_history(
     include_attributes: bool = True,
 ) -> list:
     """
-    Retrieve detailed recorded Home Assistant entity history.
+    Retrieve detailed recorded entity history.
 
-    Returns actual state records and timestamps rather than
-    aggregated numeric statistics.
-
-    Supports climate entities, binary sensors, switches,
-    automations and other recorded entities.
-
-    Timestamps must be ISO 8601 with a timezone offset.
+    Returns actual state records and timestamps.
     Maximum 10 entities and 24 hours per request.
+    Timestamps must include a timezone offset.
     """
 
-    supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
-
-    if not supervisor_token:
-        raise RuntimeError("Home Assistant API access is unavailable")
+    token = supervisor_token()
 
     if not entity_ids or len(entity_ids) > 10:
-        raise ValueError("Supply between 1 and 10 entity IDs")
+        raise ValueError(
+            "Supply between 1 and 10 entity IDs"
+        )
 
     for entity_id in entity_ids:
-        if not re.fullmatch(r"[a-z0-9_]+\.[a-z0-9_]+", entity_id):
+        if not re.fullmatch(
+            r"[a-z0-9_]+\.[a-z0-9_]+",
+            entity_id,
+        ):
             raise ValueError("Invalid entity ID")
 
     start = parse_timestamp(start_time)
+
     end = (
         parse_timestamp(end_time)
         if end_time
@@ -203,10 +261,14 @@ def get_entity_history(
     )
 
     if end <= start:
-        raise ValueError("End time must be after start time")
+        raise ValueError(
+            "End time must be after start time"
+        )
 
     if end - start > timedelta(hours=24):
-        raise ValueError("Maximum history period is 24 hours")
+        raise ValueError(
+            "Maximum history period is 24 hours"
+        )
 
     params = {
         "filter_entity_id": ",".join(entity_ids),
@@ -226,7 +288,7 @@ def get_entity_history(
     request = Request(
         url,
         headers={
-            "Authorization": f"Bearer {supervisor_token}",
+            "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         },
         method="GET",
@@ -234,11 +296,13 @@ def get_entity_history(
 
     try:
         with urlopen(request, timeout=30) as response:
-            payload = response.read(4 * 1024 * 1024 + 1)
+            payload = response.read(
+                4 * 1024 * 1024 + 1
+            )
 
     except HTTPError as exc:
         raise RuntimeError(
-            f"Home Assistant history API returned HTTP {exc.code}"
+            f"History API returned HTTP {exc.code}"
         ) from None
 
     except URLError:
@@ -248,14 +312,14 @@ def get_entity_history(
 
     if len(payload) > 4 * 1024 * 1024:
         raise ValueError(
-            "History response too large. Request fewer entities "
-            "or a shorter time period."
+            "History response too large. "
+            "Request fewer entities or a shorter period."
         )
 
     return json.loads(payload.decode("utf-8"))
 
 
-def receive_ws_message(connection) -> dict:
+def receive_ws_message(connection):
     raw = connection.recv()
 
     if len(raw) > 4 * 1024 * 1024:
@@ -264,33 +328,26 @@ def receive_ws_message(connection) -> dict:
     message = json.loads(raw)
 
     if not isinstance(message, dict):
-        raise RuntimeError("Unexpected WebSocket response")
+        raise RuntimeError(
+            "Unexpected WebSocket response"
+        )
 
     return message
 
 
-def trace_request(
-    command: str,
-    automation_id: str,
-    run_id: str = "",
-):
-    """Execute an allowlisted read-only automation trace request."""
+def websocket_request(request):
+    allowed_commands = {
+        "trace/list",
+        "trace/get",
+        "validate_config",
+    }
 
-    if command not in {"trace/list", "trace/get"}:
-        raise ValueError("WebSocket command not permitted")
+    if request.get("type") not in allowed_commands:
+        raise ValueError(
+            "WebSocket command not permitted"
+        )
 
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", automation_id):
-        raise ValueError("Invalid automation configuration ID")
-
-    if command == "trace/get":
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run_id):
-            raise ValueError("Invalid trace run ID")
-
-    supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
-
-    if not supervisor_token:
-        raise RuntimeError("Home Assistant API access is unavailable")
-
+    token = supervisor_token()
     connection = None
 
     try:
@@ -298,7 +355,7 @@ def trace_request(
             "ws://supervisor/core/websocket",
             timeout=20,
             header=[
-                f"Authorization: Bearer {supervisor_token}"
+                f"Authorization: Bearer {token}"
             ],
         )
 
@@ -307,32 +364,27 @@ def trace_request(
         if greeting.get("type") == "auth_required":
             connection.send(json.dumps({
                 "type": "auth",
-                "access_token": supervisor_token,
+                "access_token": token,
             }))
 
-            authentication = receive_ws_message(connection)
+            authentication = receive_ws_message(
+                connection
+            )
 
             if authentication.get("type") != "auth_ok":
                 raise RuntimeError(
-                    "Home Assistant WebSocket authentication failed"
+                    "WebSocket authentication failed"
                 )
 
         elif greeting.get("type") != "auth_ok":
             raise RuntimeError(
-                "Unexpected Home Assistant WebSocket greeting"
+                "Unexpected WebSocket greeting"
             )
 
-        request = {
-            "id": 1,
-            "type": command,
-            "domain": "automation",
-            "item_id": automation_id,
-        }
+        message = dict(request)
+        message["id"] = 1
 
-        if command == "trace/get":
-            request["run_id"] = run_id
-
-        connection.send(json.dumps(request))
+        connection.send(json.dumps(message))
 
         for _ in range(20):
             response = receive_ws_message(connection)
@@ -340,20 +392,23 @@ def trace_request(
             if response.get("id") != 1:
                 continue
 
-            if not response.get("success"):
-                error = response.get("error", {})
+            if response.get("success") is not True:
                 raise RuntimeError(
-                    "Home Assistant trace request failed: "
-                    + str(error.get("code", "unknown_error"))
+                    "Home Assistant WebSocket request failed: "
+                    + json.dumps(
+                        response.get("error", {})
+                    )
                 )
 
             return response.get("result")
 
-        raise RuntimeError("No matching trace response received")
+        raise RuntimeError(
+            "No matching WebSocket response received"
+        )
 
     except websocket.WebSocketException:
         raise RuntimeError(
-            "Unable to complete Home Assistant WebSocket request"
+            "Unable to complete WebSocket request"
         ) from None
 
     except OSError:
@@ -366,16 +421,49 @@ def trace_request(
             connection.close()
 
 
+def trace_request(
+    command,
+    automation_id,
+    run_id="",
+):
+    if command not in {"trace/list", "trace/get"}:
+        raise ValueError("Trace command not permitted")
+
+    if not re.fullmatch(
+        r"[A-Za-z0-9_-]{1,128}",
+        automation_id,
+    ):
+        raise ValueError(
+            "Invalid automation configuration ID"
+        )
+
+    request = {
+        "type": command,
+        "domain": "automation",
+        "item_id": automation_id,
+    }
+
+    if command == "trace/get":
+        if not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,128}",
+            run_id,
+        ):
+            raise ValueError("Invalid trace run ID")
+
+        request["run_id"] = run_id
+
+    return websocket_request(request)
+
+
 @mcp.tool()
-def list_automation_traces(automation_id: str) -> list:
+def list_automation_traces(
+    automation_id: str,
+) -> list:
     """
-    List retained execution traces for a Home Assistant automation.
+    List retained automation execution traces.
 
-    Supply the automation configuration ID from automations.yaml,
+    Supply the automation configuration ID,
     not the automation entity ID.
-
-    Returns available trace run IDs and execution metadata.
-    Only traces retained by Home Assistant are available.
     """
 
     result = trace_request(
@@ -384,7 +472,9 @@ def list_automation_traces(automation_id: str) -> list:
     )
 
     if not isinstance(result, list):
-        raise RuntimeError("Unexpected automation trace list response")
+        raise RuntimeError(
+            "Unexpected automation trace list response"
+        )
 
     return result
 
@@ -397,14 +487,8 @@ def get_automation_trace(
     """
     Retrieve a retained automation execution trace.
 
-    Supply the automation configuration ID from automations.yaml
-    and a run ID returned by list_automation_traces.
-
-    Returns recorded triggers, conditions, actions, variables,
+    Returns triggers, conditions, actions, variables,
     execution paths and errors.
-
-    This tool cannot modify or execute automations.
-    Trace contents may contain sensitive runtime information.
     """
 
     result = trace_request(
@@ -414,42 +498,45 @@ def get_automation_trace(
     )
 
     if not isinstance(result, dict):
-        raise RuntimeError("Unexpected automation trace response")
+        raise RuntimeError(
+            "Unexpected automation trace response"
+        )
 
     return result
 
 
 @mcp.tool()
-def get_automation_config(automation_id: str) -> dict:
+def get_automation_config(
+    automation_id: str,
+) -> dict:
     """
     Retrieve an existing automation through the native
     Home Assistant configuration API.
 
-    Supply the automation configuration ID from automations.yaml,
-    not the automation entity ID.
-
-    Returns the current automation configuration.
-    This tool is strictly read-only and cannot save, modify,
-    delete or execute automations.
+    Supply the automation configuration ID.
+    This tool is strictly read-only.
     """
 
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", automation_id):
-        raise ValueError("Invalid automation configuration ID")
+    if not re.fullmatch(
+        r"[A-Za-z0-9_-]{1,128}",
+        automation_id,
+    ):
+        raise ValueError(
+            "Invalid automation configuration ID"
+        )
 
-    supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
-
-    if not supervisor_token:
-        raise RuntimeError("Home Assistant API access is unavailable")
+    token = supervisor_token()
 
     url = (
-        "http://supervisor/core/api/config/automation/config/"
+        "http://supervisor/core/api/config/"
+        "automation/config/"
         + quote(automation_id, safe="")
     )
 
     request = Request(
         url,
         headers={
-            "Authorization": f"Bearer {supervisor_token}",
+            "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         },
         method="GET",
@@ -457,7 +544,9 @@ def get_automation_config(automation_id: str) -> dict:
 
     try:
         with urlopen(request, timeout=30) as response:
-            payload = response.read(1024 * 1024 + 1)
+            payload = response.read(
+                MAX_CONFIG_BYTES + 1
+            )
 
     except HTTPError as exc:
         if exc.code == 404:
@@ -466,26 +555,30 @@ def get_automation_config(automation_id: str) -> dict:
             ) from None
 
         raise RuntimeError(
-            f"Home Assistant configuration API returned HTTP {exc.code}"
+            f"Configuration API returned HTTP {exc.code}"
         ) from None
 
     except URLError:
         raise RuntimeError(
-            "Unable to reach Home Assistant configuration API"
+            "Unable to reach configuration API"
         ) from None
 
-    if len(payload) > 1024 * 1024:
-        raise ValueError("Automation configuration too large")
+    if len(payload) > MAX_CONFIG_BYTES:
+        raise ValueError(
+            "Automation configuration too large"
+        )
 
     result = json.loads(payload.decode("utf-8"))
 
     if not isinstance(result, dict):
-        raise RuntimeError("Unexpected automation configuration response")
+        raise RuntimeError(
+            "Unexpected automation configuration response"
+        )
 
     return result
 
 
-def canonical_config(config: dict) -> bytes:
+def canonical_config(config):
     return json.dumps(
         config,
         sort_keys=True,
@@ -495,13 +588,13 @@ def canonical_config(config: dict) -> bytes:
     ).encode("utf-8")
 
 
-def config_fingerprint(config: dict) -> str:
+def config_fingerprint(config):
     return hashlib.sha256(
         canonical_config(config)
     ).hexdigest()
 
 
-def readable_config(config: dict) -> str:
+def readable_config(config):
     return json.dumps(
         config,
         sort_keys=True,
@@ -511,57 +604,74 @@ def readable_config(config: dict) -> str:
     )
 
 
-def ensure_change_directory() -> Path:
-    if CHANGE_DIR.is_symlink():
-        raise RuntimeError("Unsafe proposal storage directory")
+def ensure_private_directory(directory):
+    if directory.is_symlink():
+        raise RuntimeError(
+            "Unsafe persistent storage directory"
+        )
 
-    CHANGE_DIR.mkdir(
+    directory.mkdir(
         mode=0o700,
         parents=True,
         exist_ok=True,
     )
 
-    if not CHANGE_DIR.is_dir():
-        raise RuntimeError("Proposal storage unavailable")
+    if not directory.is_dir():
+        raise RuntimeError(
+            "Persistent storage unavailable"
+        )
 
-    if CHANGE_DIR.resolve().parent != Path("/data").resolve():
-        raise RuntimeError("Unsafe proposal storage location")
+    if directory.resolve().parent != Path("/data").resolve():
+        raise RuntimeError(
+            "Unsafe persistent storage location"
+        )
 
-    CHANGE_DIR.chmod(0o700)
+    directory.chmod(0o700)
 
-    return CHANGE_DIR
+    return directory
+
+
+def ensure_change_directory():
+    return ensure_private_directory(CHANGE_DIR)
 
 
 def validate_proposed_config(
-    automation_id: str,
-    proposed_config: dict,
-) -> dict:
+    automation_id,
+    proposed_config,
+):
     """
-    Perform basic structural checks only.
-
-    This is not native Home Assistant schema validation.
+    Basic structural validation only.
+    Native validation is performed separately.
     """
 
     if not isinstance(proposed_config, dict):
-        raise ValueError("Proposed configuration must be an object")
+        raise ValueError(
+            "Proposed configuration must be an object"
+        )
 
     if len(canonical_config(proposed_config)) > MAX_CONFIG_BYTES:
-        raise ValueError("Proposed configuration too large")
+        raise ValueError(
+            "Proposed configuration too large"
+        )
 
     proposed = json.loads(
-        canonical_config(proposed_config).decode("utf-8")
+        canonical_config(proposed_config)
     )
 
     if "id" in proposed:
         if str(proposed["id"]) != automation_id:
-            raise ValueError("Automation ID cannot be changed")
+            raise ValueError(
+                "Automation ID cannot be changed"
+            )
 
     proposed["id"] = automation_id
 
     alias = proposed.get("alias")
 
     if not isinstance(alias, str) or not alias.strip():
-        raise ValueError("A non-empty automation alias is required")
+        raise ValueError(
+            "A non-empty automation alias is required"
+        )
 
     for singular, plural in (
         ("trigger", "triggers"),
@@ -589,35 +699,52 @@ def validate_proposed_config(
     )
 
     if not isinstance(triggers, list):
-        raise ValueError("Triggers must be supplied as a list")
+        raise ValueError(
+            "Triggers must be supplied as a list"
+        )
 
     if not isinstance(actions, list) or not actions:
-        raise ValueError("A non-empty actions list is required")
+        raise ValueError(
+            "A non-empty actions list is required"
+        )
 
     if not isinstance(conditions, list):
-        raise ValueError("Conditions must be supplied as a list")
+        raise ValueError(
+            "Conditions must be supplied as a list"
+        )
 
-    for section in (triggers, actions, conditions):
-        if not all(isinstance(item, dict) for item in section):
+    for section in (
+        triggers,
+        actions,
+        conditions,
+    ):
+        if not all(
+            isinstance(item, dict)
+            for item in section
+        ):
             raise ValueError(
-                "Trigger, condition and action entries must be objects"
+                "Configuration entries must be objects"
             )
 
     mode = proposed.get("mode", "single")
 
-    if mode not in {"single", "restart", "queued", "parallel"}:
+    if mode not in {
+        "single",
+        "restart",
+        "queued",
+        "parallel",
+    }:
         raise ValueError("Invalid automation mode")
 
     if len(canonical_config(proposed)) > MAX_CONFIG_BYTES:
-        raise ValueError("Proposed configuration too large")
+        raise ValueError(
+            "Proposed configuration too large"
+        )
 
     return proposed
 
 
-def make_config_diff(
-    original: dict,
-    proposed: dict,
-) -> str:
+def make_config_diff(original, proposed):
     return "\n".join(
         difflib.unified_diff(
             readable_config(original).splitlines(),
@@ -629,12 +756,27 @@ def make_config_diff(
     )
 
 
-def store_change(record: dict) -> None:
+def sync_directory(directory):
+    fd = os.open(
+        directory,
+        os.O_RDONLY | os.O_DIRECTORY,
+    )
+
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def store_change(record):
     directory = ensure_change_directory()
 
     change_id = record["change_id"]
 
-    if not re.fullmatch(r"[a-f0-9]{32}", change_id):
+    if not re.fullmatch(
+        r"[a-f0-9]{32}",
+        change_id,
+    ):
         raise ValueError("Invalid change reference")
 
     destination = directory / f"{change_id}.json"
@@ -670,7 +812,11 @@ def store_change(record: dict) -> None:
         )
 
         try:
-            fd = os.open(temporary, flags, 0o600)
+            fd = os.open(
+                temporary,
+                flags,
+                0o600,
+            )
 
             with os.fdopen(fd, "wb") as handle:
                 handle.write(payload)
@@ -679,22 +825,17 @@ def store_change(record: dict) -> None:
 
             os.link(temporary, destination)
 
-            directory_fd = os.open(
-                directory,
-                os.O_RDONLY | os.O_DIRECTORY,
-            )
-
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            sync_directory(directory)
 
         finally:
             temporary.unlink(missing_ok=True)
 
 
-def load_change(change_id: str) -> dict:
-    if not re.fullmatch(r"[a-f0-9]{32}", change_id):
+def load_change(change_id):
+    if not re.fullmatch(
+        r"[a-f0-9]{32}",
+        change_id,
+    ):
         raise ValueError("Invalid change reference")
 
     directory = ensure_change_directory()
@@ -716,34 +857,81 @@ def load_change(change_id: str) -> dict:
         raise RuntimeError("Invalid proposal record")
 
     if record.get("change_id") != change_id:
-        raise RuntimeError("Proposal reference mismatch")
+        raise RuntimeError(
+            "Proposal reference mismatch"
+        )
 
     if record.get("schema_version") != 1:
-        raise RuntimeError("Unsupported proposal record version")
+        raise RuntimeError(
+            "Unsupported proposal record version"
+        )
 
     if record.get("status") != "prepared_only":
-        raise RuntimeError("Unexpected proposal status")
+        raise RuntimeError(
+            "Unexpected proposal status"
+        )
 
     original = record.get("original_config")
     proposed = record.get("proposed_config")
 
     if not isinstance(original, dict):
-        raise RuntimeError("Original configuration missing")
+        raise RuntimeError(
+            "Original configuration missing"
+        )
 
     if not isinstance(proposed, dict):
-        raise RuntimeError("Proposed configuration missing")
+        raise RuntimeError(
+            "Proposed configuration missing"
+        )
 
     if config_fingerprint(original) != record.get(
         "original_fingerprint"
     ):
-        raise RuntimeError("Original configuration integrity check failed")
+        raise RuntimeError(
+            "Original configuration integrity check failed"
+        )
 
     if config_fingerprint(proposed) != record.get(
         "proposed_fingerprint"
     ):
-        raise RuntimeError("Proposed configuration integrity check failed")
+        raise RuntimeError(
+            "Proposed configuration integrity check failed"
+        )
 
     return record
+
+
+def create_change_record(
+    automation_id,
+    original,
+    proposed,
+    reason,
+):
+    return {
+        "schema_version": 1,
+        "change_id": secrets.token_hex(16),
+        "automation_id": automation_id,
+        "alias": original.get("alias"),
+        "created_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "reason": reason.strip(),
+        "status": "prepared_only",
+        "approved": False,
+        "native_validation_performed": False,
+        "original_fingerprint": config_fingerprint(
+            original
+        ),
+        "proposed_fingerprint": config_fingerprint(
+            proposed
+        ),
+        "original_config": original,
+        "proposed_config": proposed,
+        "diff": make_config_diff(
+            original,
+            proposed,
+        ),
+    }
 
 
 @mcp.tool()
@@ -753,27 +941,27 @@ def prepare_automation_change(
     reason: str,
 ) -> dict:
     """
-    Prepare a proposed replacement for an existing automation.
+    Prepare a complete proposed replacement configuration.
 
-    Supply the complete proposed automation configuration,
-    not a partial patch, and a reason for the change.
+    Stores the original and proposed configurations,
+    fingerprints and comparison in persistent app storage.
 
-    Retrieves the original through the native Home Assistant API,
-    performs basic structural checks, calculates fingerprints,
-    generates a comparison and stores both configurations in
-    persistent app storage.
-
-    Does not modify, reload, execute or delete any automation.
-
-    Native Home Assistant schema validation is not performed.
-    A prepared proposal is not an approved change.
+    Does not modify, reload or execute automations.
+    Native validation and approval are separate.
     """
 
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", automation_id):
-        raise ValueError("Invalid automation configuration ID")
+    if not re.fullmatch(
+        r"[A-Za-z0-9_-]{1,128}",
+        automation_id,
+    ):
+        raise ValueError(
+            "Invalid automation configuration ID"
+        )
 
     if not isinstance(reason, str) or not reason.strip():
-        raise ValueError("A reason for the proposed change is required")
+        raise ValueError(
+            "A reason for the change is required"
+        )
 
     if len(reason) > 2000:
         raise ValueError("Change reason too long")
@@ -783,15 +971,18 @@ def prepare_automation_change(
         proposed_config,
     )
 
-    original = get_automation_config(automation_id)
+    original = get_automation_config(
+        automation_id
+    )
 
     if str(original.get("id", "")) != automation_id:
-        raise RuntimeError("Original automation ID mismatch")
+        raise RuntimeError(
+            "Original automation ID mismatch"
+        )
 
-    original_hash = config_fingerprint(original)
-    proposed_hash = config_fingerprint(proposed)
-
-    if original_hash == proposed_hash:
+    if config_fingerprint(original) == config_fingerprint(
+        proposed
+    ):
         return {
             "status": "no_changes",
             "automation_id": automation_id,
@@ -799,47 +990,34 @@ def prepare_automation_change(
             "live_configuration_modified": False,
         }
 
-    comparison = make_config_diff(
+    record = create_change_record(
+        automation_id,
         original,
         proposed,
+        reason,
     )
-
-    change_id = secrets.token_hex(16)
-
-    record = {
-        "schema_version": 1,
-        "change_id": change_id,
-        "automation_id": automation_id,
-        "alias": original.get("alias"),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "reason": reason.strip(),
-        "status": "prepared_only",
-        "approved": False,
-        "native_validation_performed": False,
-        "original_fingerprint": original_hash,
-        "proposed_fingerprint": proposed_hash,
-        "original_config": original,
-        "proposed_config": proposed,
-        "diff": comparison,
-    }
 
     store_change(record)
 
     return {
         "status": "prepared_only",
-        "change_id": change_id,
+        "change_id": record["change_id"],
         "automation_id": automation_id,
-        "alias": original.get("alias"),
+        "alias": record["alias"],
         "created_at": record["created_at"],
         "reason": record["reason"],
-        "original_fingerprint": original_hash,
-        "proposed_fingerprint": proposed_hash,
+        "original_fingerprint": record[
+            "original_fingerprint"
+        ],
+        "proposed_fingerprint": record[
+            "proposed_fingerprint"
+        ],
         "backup_stored": True,
         "structural_checks_passed": True,
         "native_validation_performed": False,
         "approved": False,
         "live_configuration_modified": False,
-        "diff": comparison,
+        "diff": record["diff"],
     }
 
 
@@ -848,15 +1026,12 @@ def review_automation_change(
     change_id: str,
 ) -> dict:
     """
-    Review a previously prepared automation change.
+    Review a prepared automation change and backup.
 
-    Returns the original and proposed configurations,
-    fingerprints, comparison and backup information.
+    Compares the current live configuration with the
+    original fingerprint to detect conflicts.
 
-    Also retrieves the current live configuration and
-    checks whether it has changed since preparation.
-
-    Does not approve, apply, modify or execute anything.
+    Does not approve or apply changes.
     """
 
     record = load_change(change_id)
@@ -864,14 +1039,9 @@ def review_automation_change(
     original = record["original_config"]
     proposed = record["proposed_config"]
 
-    comparison = make_config_diff(
-        original,
-        proposed,
-    )
-
     result = {
         "status": "prepared_only",
-        "change_id": record["change_id"],
+        "change_id": change_id,
         "automation_id": record["automation_id"],
         "alias": record.get("alias"),
         "created_at": record["created_at"],
@@ -879,11 +1049,18 @@ def review_automation_change(
         "approved": False,
         "native_validation_performed": False,
         "backup_integrity_verified": True,
-        "original_fingerprint": record["original_fingerprint"],
-        "proposed_fingerprint": record["proposed_fingerprint"],
+        "original_fingerprint": record[
+            "original_fingerprint"
+        ],
+        "proposed_fingerprint": record[
+            "proposed_fingerprint"
+        ],
         "original_config": original,
         "proposed_config": proposed,
-        "diff": comparison,
+        "diff": make_config_diff(
+            original,
+            proposed,
+        ),
         "live_configuration_modified": False,
     }
 
@@ -895,8 +1072,10 @@ def review_automation_change(
         current_hash = config_fingerprint(current)
 
         result["current_fingerprint"] = current_hash
+
         result["conflict_detected"] = (
-            current_hash != record["original_fingerprint"]
+            current_hash
+            != record["original_fingerprint"]
         )
 
         result["live_check_completed"] = True
@@ -905,19 +1084,625 @@ def review_automation_change(
         result["live_check_completed"] = False
         result["conflict_detected"] = None
         result["warning"] = (
-            "Unable to verify the current live configuration. "
+            "Unable to verify live configuration. "
             "Do not treat this proposal as safe to apply."
         )
 
     return result
 
 
+# --------------------------------------------------
+# CONTROLLED EDITING
+# Version 0.3.0: restricted to the test automation.
+# --------------------------------------------------
+
+
+def check_test_automation(automation_id):
+    if automation_id != TEST_AUTOMATION_ID:
+        raise PermissionError(
+            "Editing is restricted to MCP Editing Test"
+        )
+
+
+def check_test_config(config):
+    if str(config.get("id")) != TEST_AUTOMATION_ID:
+        raise ValueError(
+            "Incorrect test automation ID"
+        )
+
+    if config.get("alias") != "MCP Editing Test":
+        raise ValueError(
+            "Incorrect test automation alias"
+        )
+
+    allowed = {
+        "id",
+        "alias",
+        "description",
+        "triggers",
+        "conditions",
+        "actions",
+        "mode",
+    }
+
+    if set(config) - allowed:
+        raise ValueError(
+            "Unexpected test configuration fields"
+        )
+
+    description = config.get("description", "")
+
+    if not isinstance(description, str):
+        raise ValueError(
+            "Description must be text"
+        )
+
+    if config.get("triggers") != [
+        {
+            "trigger": "event",
+            "event_type": "mcp_editing_test",
+        }
+    ]:
+        raise ValueError(
+            "Test trigger cannot be changed"
+        )
+
+    if config.get("conditions", []) != []:
+        raise ValueError(
+            "Test conditions cannot be changed"
+        )
+
+    if config.get("mode") != "single":
+        raise ValueError(
+            "Test automation must use single mode"
+        )
+
+    actions = config.get("actions")
+
+    if not isinstance(actions, list) or len(actions) != 1:
+        raise ValueError(
+            "Exactly one delay action is permitted"
+        )
+
+    action = actions[0]
+
+    if not isinstance(action, dict):
+        raise ValueError("Invalid test action")
+
+    if set(action) != {"delay"}:
+        raise ValueError(
+            "Only a delay action is permitted"
+        )
+
+    delay = action["delay"]
+
+    if not isinstance(delay, dict):
+        raise ValueError(
+            "Delay must be an object"
+        )
+
+    if set(delay) != {"seconds"}:
+        raise ValueError(
+            "Delay must be expressed in seconds"
+        )
+
+    seconds = delay["seconds"]
+
+    if type(seconds) is not int or not 1 <= seconds <= 10:
+        raise ValueError(
+            "Delay must be between 1 and 10 seconds"
+        )
+
+
+def native_validate(config):
+    check_test_config(config)
+
+    result = websocket_request({
+        "type": "validate_config",
+        "trigger": config.get("triggers", []),
+        "condition": config.get("conditions", []),
+        "action": config.get("actions", []),
+    })
+
+    if not isinstance(result, dict):
+        raise RuntimeError(
+            "Unexpected native validation result"
+        )
+
+    for section in (
+        "trigger",
+        "condition",
+        "action",
+    ):
+        validation = result.get(section)
+
+        if not isinstance(validation, dict):
+            raise RuntimeError(
+                f"No validation result for {section}"
+            )
+
+        if validation.get("valid") is not True:
+            raise ValueError(
+                f"Native validation failed for {section}: "
+                + json.dumps(validation)
+            )
+
+    return result
+
+
+def approval_reference(record):
+    return (
+        record["change_id"]
+        + ":"
+        + record["proposed_fingerprint"]
+    )
+
+
+def approval_expiry(record):
+    return (
+        parse_timestamp(record["created_at"])
+        + timedelta(minutes=APPROVAL_MINUTES)
+    )
+
+
+def approval_used(record):
+    directory = ensure_private_directory(
+        APPROVAL_DIR
+    )
+
+    marker = directory / (
+        record["change_id"] + ".json"
+    )
+
+    return marker.exists() or marker.is_symlink()
+
+
+def check_approval(record):
+    if approval_used(record):
+        raise PermissionError(
+            "This approval has already been consumed"
+        )
+
+    if OPTIONS_FILE.is_symlink():
+        raise RuntimeError(
+            "Unsafe app configuration file"
+        )
+
+    if not OPTIONS_FILE.is_file():
+        raise RuntimeError(
+            "App configuration options unavailable"
+        )
+
+    if OPTIONS_FILE.stat().st_size > 65536:
+        raise RuntimeError(
+            "App configuration file too large"
+        )
+
+    options = json.loads(
+        OPTIONS_FILE.read_text(
+            encoding="utf-8"
+        )
+    )
+
+    approved = options.get(
+        "approved_change",
+        "",
+    )
+
+    expected = approval_reference(record)
+
+    if not isinstance(approved, str):
+        raise PermissionError(
+            "Invalid approval configuration"
+        )
+
+    if not secrets.compare_digest(
+        approved,
+        expected,
+    ):
+        raise PermissionError(
+            "Independent approval has not been supplied"
+        )
+
+    created = parse_timestamp(
+        record["created_at"]
+    )
+
+    now = datetime.now(timezone.utc)
+
+    if now < created:
+        raise PermissionError(
+            "Invalid proposal timestamp"
+        )
+
+    if now > approval_expiry(record):
+        raise PermissionError(
+            "Proposal has expired. Prepare a new proposal."
+        )
+
+
+def consume_approval(record):
+    directory = ensure_private_directory(
+        APPROVAL_DIR
+    )
+
+    change_id = record["change_id"]
+
+    if not re.fullmatch(
+        r"[a-f0-9]{32}",
+        change_id,
+    ):
+        raise ValueError(
+            "Invalid change reference"
+        )
+
+    marker = directory / f"{change_id}.json"
+
+    payload = json.dumps({
+        "change_id": change_id,
+        "proposed_fingerprint": record[
+            "proposed_fingerprint"
+        ],
+        "consumed_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+    }).encode("utf-8")
+
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+    )
+
+    try:
+        fd = os.open(
+            marker,
+            flags,
+            0o600,
+        )
+
+    except FileExistsError:
+        raise PermissionError(
+            "This approval has already been consumed"
+        ) from None
+
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    sync_directory(directory)
+
+
+def save_native_config(
+    automation_id,
+    config,
+):
+    check_test_automation(automation_id)
+    check_test_config(config)
+
+    token = supervisor_token()
+
+    url = (
+        "http://supervisor/core/api/config/"
+        "automation/config/"
+        + quote(automation_id, safe="")
+    )
+
+    payload = dict(config)
+    payload.pop("id", None)
+
+    request = Request(
+        url,
+        data=json.dumps(
+            payload,
+            allow_nan=False,
+        ).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=30) as response:
+            raw = response.read(
+                MAX_CONFIG_BYTES + 1
+            )
+
+    except HTTPError as exc:
+        raise RuntimeError(
+            f"Native save returned HTTP {exc.code}. "
+            "Check live configuration before retrying."
+        ) from None
+
+    except URLError:
+        raise RuntimeError(
+            "Native save connection failed. "
+            "Save outcome may be uncertain."
+        ) from None
+
+    if len(raw) > MAX_CONFIG_BYTES:
+        raise RuntimeError(
+            "Save response too large"
+        )
+
+    return json.loads(raw.decode("utf-8"))
+
+
+@mcp.tool()
+def validate_automation_change(
+    change_id: str,
+) -> dict:
+    """
+    Validate a prepared test automation change.
+
+    Uses native Home Assistant WebSocket validation.
+    Returns an independent approval reference.
+
+    Does not save, approve or execute the automation.
+    """
+
+    record = load_change(change_id)
+
+    check_test_automation(
+        record["automation_id"]
+    )
+
+    proposed = record["proposed_config"]
+
+    check_test_config(proposed)
+
+    if approval_used(record):
+        raise PermissionError(
+            "This proposal has already been consumed"
+        )
+
+    if datetime.now(timezone.utc) > approval_expiry(record):
+        raise PermissionError(
+            "Proposal has expired"
+        )
+
+    current = get_automation_config(
+        record["automation_id"]
+    )
+
+    check_test_config(current)
+
+    if config_fingerprint(current) != record[
+        "original_fingerprint"
+    ]:
+        raise RuntimeError(
+            "Live configuration has changed since preparation"
+        )
+
+    result = native_validate(proposed)
+
+    return {
+        "change_id": change_id,
+        "automation_id": record["automation_id"],
+        "native_validation_passed": True,
+        "validation_result": result,
+        "conflict_detected": False,
+        "approval_reference": approval_reference(
+            record
+        ),
+        "approval_expires_at": approval_expiry(
+            record
+        ).isoformat(),
+        "approval_required": True,
+        "live_configuration_modified": False,
+    }
+
+
+@mcp.tool()
+def apply_automation_change(
+    change_id: str,
+) -> dict:
+    """
+    Apply an independently approved test automation change.
+
+    Restricted to MCP Editing Test.
+
+    Requires matching approval in Home Assistant app
+    configuration. Approval is single-use and expires
+    60 minutes after preparation.
+
+    Performs native validation, conflict detection,
+    saving and read-back verification.
+
+    Never automatically retries a failed save.
+    """
+
+    with EDIT_LOCK:
+        record = load_change(change_id)
+
+        automation_id = record["automation_id"]
+
+        check_test_automation(automation_id)
+
+        proposed = record["proposed_config"]
+
+        check_test_config(proposed)
+        check_approval(record)
+
+        validation = native_validate(proposed)
+
+        current = get_automation_config(
+            automation_id
+        )
+
+        check_test_config(current)
+
+        if config_fingerprint(current) != record[
+            "original_fingerprint"
+        ]:
+            raise RuntimeError(
+                "Configuration conflict. Nothing saved."
+            )
+
+        check_approval(record)
+        consume_approval(record)
+
+        try:
+            save_response = save_native_config(
+                automation_id,
+                proposed,
+            )
+
+        except Exception as exc:
+            return {
+                "status": "save_outcome_uncertain",
+                "change_id": change_id,
+                "approval_consumed": True,
+                "error": str(exc),
+                "warning": (
+                    "Inspect live configuration. "
+                    "Do not automatically retry."
+                ),
+            }
+
+        try:
+            actual = get_automation_config(
+                automation_id
+            )
+
+            actual_hash = config_fingerprint(
+                actual
+            )
+
+        except Exception as exc:
+            return {
+                "status": "saved_but_unverified",
+                "change_id": change_id,
+                "approval_consumed": True,
+                "save_response": save_response,
+                "error": str(exc),
+            }
+
+        verified = (
+            actual_hash
+            == record["proposed_fingerprint"]
+        )
+
+        return {
+            "status": (
+                "saved_and_verified"
+                if verified
+                else "verification_mismatch"
+            ),
+            "change_id": change_id,
+            "automation_id": automation_id,
+            "approval_consumed": True,
+            "native_validation_passed": True,
+            "validation_result": validation,
+            "save_response": save_response,
+            "expected_fingerprint": record[
+                "proposed_fingerprint"
+            ],
+            "actual_fingerprint": actual_hash,
+            "verification_passed": verified,
+            "original_backup_retained": True,
+            "actual_config": actual,
+        }
+
+
+@mcp.tool()
+def prepare_automation_rollback(
+    change_id: str,
+) -> dict:
+    """
+    Prepare restoration of an original test configuration.
+
+    Does not apply the rollback.
+
+    Returns a new proposal requiring native validation
+    and independent single-use approval.
+    """
+
+    with EDIT_LOCK:
+        previous = load_change(change_id)
+
+        automation_id = previous["automation_id"]
+
+        check_test_automation(automation_id)
+
+        current = get_automation_config(
+            automation_id
+        )
+
+        check_test_config(current)
+
+        original = validate_proposed_config(
+            automation_id,
+            previous["original_config"],
+        )
+
+        check_test_config(original)
+
+        current_hash = config_fingerprint(
+            current
+        )
+
+        original_hash = config_fingerprint(
+            original
+        )
+
+        if current_hash == original_hash:
+            return {
+                "status": "already_restored",
+                "live_configuration_modified": False,
+            }
+
+        if current_hash != previous[
+            "proposed_fingerprint"
+        ]:
+            raise RuntimeError(
+                "Live configuration differs from the "
+                "previous proposal. Rollback refused."
+            )
+
+        record = create_change_record(
+            automation_id,
+            current,
+            original,
+            "Restore original configuration from "
+            + change_id,
+        )
+
+        store_change(record)
+
+        return {
+            "status": "rollback_prepared",
+            "change_id": record["change_id"],
+            "automation_id": automation_id,
+            "approval_required": True,
+            "backup_stored": True,
+            "live_configuration_modified": False,
+            "diff": record["diff"],
+        }
+
+
 class TokenMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        authorization = request.headers.get("authorization", "")
+    async def dispatch(
+        self,
+        request,
+        call_next,
+    ):
+        authorization = request.headers.get(
+            "authorization",
+            "",
+        )
+
         expected = f"Bearer {TOKEN}"
 
-        if not secrets.compare_digest(authorization, expected):
+        if not secrets.compare_digest(
+            authorization,
+            expected,
+        ):
             return JSONResponse(
                 {"error": "unauthorized"},
                 status_code=401,
