@@ -1,7 +1,12 @@
 import os
 import json
 import secrets
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.request import Request, urlopen
+from urllib.parse import urlencode, quote
+from urllib.error import HTTPError, URLError
 
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -94,6 +99,7 @@ def template_entries() -> list:
         "core.config_entries",
         frozenset({"core.config_entries"}),
     )
+
     if p.stat().st_size > 16 * 1024 * 1024:
         raise ValueError("Configuration entries file too large")
 
@@ -134,12 +140,121 @@ def read_template_helper(entry_id: str) -> dict:
     raise ValueError("Template helper not found")
 
 
+def parse_timestamp(value: str) -> datetime:
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("Use an ISO 8601 timestamp")
+
+    if dt.tzinfo is None:
+        raise ValueError("Timestamp must include a timezone offset")
+
+    return dt.astimezone(timezone.utc)
+
+
+@mcp.tool()
+def get_entity_history(
+    entity_ids: list[str],
+    start_time: str,
+    end_time: str = "",
+    include_attributes: bool = True,
+) -> list:
+    """
+    Retrieve detailed recorded Home Assistant entity history.
+
+    Returns actual state records and timestamps rather than
+    aggregated numeric statistics.
+
+    Supports climate entities, binary sensors, switches,
+    automations and other recorded entities.
+
+    Timestamps must be ISO 8601 with a timezone offset.
+    Maximum 10 entities and 24 hours per request.
+    """
+
+    supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
+
+    if not supervisor_token:
+        raise RuntimeError("Home Assistant API access is unavailable")
+
+    if not entity_ids or len(entity_ids) > 10:
+        raise ValueError("Supply between 1 and 10 entity IDs")
+
+    for entity_id in entity_ids:
+        if not re.fullmatch(r"[a-z0-9_]+\.[a-z0-9_]+", entity_id):
+            raise ValueError("Invalid entity ID")
+
+    start = parse_timestamp(start_time)
+    end = (
+        parse_timestamp(end_time)
+        if end_time
+        else datetime.now(timezone.utc)
+    )
+
+    if end <= start:
+        raise ValueError("End time must be after start time")
+
+    if end - start > timedelta(hours=24):
+        raise ValueError("Maximum history period is 24 hours")
+
+    params = {
+        "filter_entity_id": ",".join(entity_ids),
+        "end_time": end.isoformat(),
+    }
+
+    if not include_attributes:
+        params["no_attributes"] = "true"
+
+    url = (
+        "http://supervisor/core/api/history/period/"
+        + quote(start.isoformat(), safe="")
+        + "?"
+        + urlencode(params)
+    )
+
+    request = Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {supervisor_token}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+
+    try:
+        with urlopen(request, timeout=30) as response:
+            payload = response.read(4 * 1024 * 1024 + 1)
+
+    except HTTPError as exc:
+        raise RuntimeError(
+            f"Home Assistant history API returned HTTP {exc.code}"
+        ) from None
+
+    except URLError:
+        raise RuntimeError(
+            "Unable to reach Home Assistant history API"
+        ) from None
+
+    if len(payload) > 4 * 1024 * 1024:
+        raise ValueError(
+            "History response too large. Request fewer entities "
+            "or a shorter time period."
+        )
+
+    return json.loads(payload.decode("utf-8"))
+
+
 class TokenMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         authorization = request.headers.get("authorization", "")
         expected = f"Bearer {TOKEN}"
+
         if not secrets.compare_digest(authorization, expected):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
+            return JSONResponse(
+                {"error": "unauthorized"},
+                status_code=401,
+            )
+
         return await call_next(request)
 
 
