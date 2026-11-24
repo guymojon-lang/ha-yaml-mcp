@@ -8,6 +8,8 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode, quote
 from urllib.error import HTTPError, URLError
 
+import websocket
+
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -242,6 +244,170 @@ def get_entity_history(
         )
 
     return json.loads(payload.decode("utf-8"))
+
+
+def receive_ws_message(connection) -> dict:
+    raw = connection.recv()
+
+    if len(raw) > 4 * 1024 * 1024:
+        raise ValueError("WebSocket response too large")
+
+    message = json.loads(raw)
+
+    if not isinstance(message, dict):
+        raise RuntimeError("Unexpected WebSocket response")
+
+    return message
+
+
+def trace_request(
+    command: str,
+    automation_id: str,
+    run_id: str = "",
+):
+    """Execute an allowlisted read-only automation trace request."""
+
+    if command not in {"trace/list", "trace/get"}:
+        raise ValueError("WebSocket command not permitted")
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", automation_id):
+        raise ValueError("Invalid automation configuration ID")
+
+    if command == "trace/get":
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run_id):
+            raise ValueError("Invalid trace run ID")
+
+    supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
+
+    if not supervisor_token:
+        raise RuntimeError("Home Assistant API access is unavailable")
+
+    connection = None
+
+    try:
+        connection = websocket.create_connection(
+            "ws://supervisor/core/websocket",
+            timeout=20,
+            header=[
+                f"Authorization: Bearer {supervisor_token}"
+            ],
+        )
+
+        greeting = receive_ws_message(connection)
+
+        if greeting.get("type") == "auth_required":
+            connection.send(json.dumps({
+                "type": "auth",
+                "access_token": supervisor_token,
+            }))
+
+            authentication = receive_ws_message(connection)
+
+            if authentication.get("type") != "auth_ok":
+                raise RuntimeError(
+                    "Home Assistant WebSocket authentication failed"
+                )
+
+        elif greeting.get("type") != "auth_ok":
+            raise RuntimeError(
+                "Unexpected Home Assistant WebSocket greeting"
+            )
+
+        request = {
+            "id": 1,
+            "type": command,
+            "domain": "automation",
+            "item_id": automation_id,
+        }
+
+        if command == "trace/get":
+            request["run_id"] = run_id
+
+        connection.send(json.dumps(request))
+
+        for _ in range(20):
+            response = receive_ws_message(connection)
+
+            if response.get("id") != 1:
+                continue
+
+            if not response.get("success"):
+                error = response.get("error", {})
+                raise RuntimeError(
+                    "Home Assistant trace request failed: "
+                    + str(error.get("code", "unknown_error"))
+                )
+
+            return response.get("result")
+
+        raise RuntimeError("No matching trace response received")
+
+    except websocket.WebSocketException:
+        raise RuntimeError(
+            "Unable to complete Home Assistant WebSocket request"
+        ) from None
+
+    except OSError:
+        raise RuntimeError(
+            "Unable to reach Home Assistant WebSocket API"
+        ) from None
+
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+@mcp.tool()
+def list_automation_traces(automation_id: str) -> list:
+    """
+    List retained execution traces for a Home Assistant automation.
+
+    Supply the automation configuration ID from automations.yaml,
+    not the automation entity ID.
+
+    Returns available trace run IDs and execution metadata.
+    Only traces retained by Home Assistant are available.
+    """
+
+    result = trace_request(
+        "trace/list",
+        automation_id,
+    )
+
+    if not isinstance(result, list):
+        raise RuntimeError("Unexpected automation trace list response")
+
+    return result
+
+
+@mcp.tool()
+def get_automation_trace(
+    automation_id: str,
+    run_id: str,
+) -> dict:
+    """
+    Retrieve a retained automation execution trace.
+
+    Supply the automation configuration ID from automations.yaml
+    and a run ID returned by list_automation_traces.
+
+    Returns recorded triggers, conditions, actions, variables,
+    execution paths and errors.
+
+    This tool cannot modify or execute automations.
+    Trace contents may contain sensitive runtime information.
+    """
+
+    result = trace_request(
+        "trace/get",
+        automation_id,
+        run_id,
+    )
+
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected automation trace response")
+
+    return result
 
 
 class TokenMiddleware(BaseHTTPMiddleware):
