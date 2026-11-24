@@ -1,5 +1,5 @@
-
 import os
+import json
 import secrets
 from pathlib import Path
 
@@ -85,6 +85,53 @@ def read_dashboard(filename: str) -> str:
     if p.stat().st_size > 1024 * 1024:
         raise ValueError("Dashboard file too large")
     return p.read_text(encoding="utf-8")
+
+
+def template_entries() -> list:
+    directory = (CONFIG / ".storage").resolve()
+    p = safe_file(
+        directory,
+        "core.config_entries",
+        frozenset({"core.config_entries"}),
+    )
+    if p.stat().st_size > 16 * 1024 * 1024:
+        raise ValueError("Configuration entries file too large")
+
+    content = json.loads(p.read_text(encoding="utf-8"))
+
+    return [
+        entry
+        for entry in content.get("data", {}).get("entries", [])
+        if entry.get("domain") == "template"
+    ]
+
+
+@mcp.tool()
+def list_template_helpers() -> list[dict]:
+    """List UI-created Home Assistant template helpers."""
+    return [
+        {
+            "entry_id": entry.get("entry_id"),
+            "title": entry.get("title"),
+            "disabled_by": entry.get("disabled_by"),
+        }
+        for entry in template_entries()
+    ]
+
+
+@mcp.tool()
+def read_template_helper(entry_id: str) -> dict:
+    """Read the configuration and Jinja templates of a template helper."""
+    for entry in template_entries():
+        if entry.get("entry_id") == entry_id:
+            return {
+                "entry_id": entry.get("entry_id"),
+                "title": entry.get("title"),
+                "data": entry.get("data", {}),
+                "options": entry.get("options", {}),
+            }
+
+    raise ValueError("Template helper not found")
 
 
 class TokenMiddleware(BaseHTTPMiddleware):
