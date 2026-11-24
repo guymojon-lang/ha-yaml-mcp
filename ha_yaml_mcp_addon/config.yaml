@@ -1,5 +1,5 @@
 name: "HA YAML MCP (Read-Only)"
-version: "0.2.0"
+version: "0.2.1"
 slug: "ha_yaml_mcp"
 description: "Read-only MCP access to Home Assistant YAML, dashboards, template helpers and entity history"
 url: "https://github.com/guymojon-lang/ha-yaml-mcp"
