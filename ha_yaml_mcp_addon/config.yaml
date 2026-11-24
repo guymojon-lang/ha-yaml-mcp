@@ -1,7 +1,7 @@
-name: "HA YAML MCP (Read-Only)"
-version: "0.2.2"
+name: "HA YAML MCP"
+version: "0.3.0"
 slug: "ha_yaml_mcp"
-description: "Read-only MCP access to Home Assistant YAML, dashboards, template helpers and entity history"
+description: "Home Assistant MCP diagnostics and controlled automation editing"
 url: "https://github.com/guymojon-lang/ha-yaml-mcp"
 startup: "application"
 boot: "manual"
@@ -17,5 +17,7 @@ arch:
 map:
   - type: homeassistant_config
     read_only: true
-options: {}
-schema: {}
+options:
+  approved_change: ""
+schema:
+  approved_change: str
