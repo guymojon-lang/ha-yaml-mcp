@@ -26,8 +26,8 @@ CHANGE_DIR = Path("/data/automation_changes")
 APPROVAL_DIR = Path("/data/used_approvals")
 OPTIONS_FILE = Path("/data/options.json")
 
-TEST_AUTOMATION_ID = "1795528642010"
 
+HELPER_DOMAINS = frozenset({"input_boolean", "input_number", "input_text", "input_select", "input_datetime", "input_button", "counter", "timer", "schedule", "zone", "person"})
 MAX_PROPOSALS = 100
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_RECORD_BYTES = 16 * 1024 * 1024
@@ -340,7 +340,8 @@ def websocket_request(request):
         "trace/list",
         "trace/get",
         "validate_config",
-    }
+        "lovelace/dashboards/list", "lovelace/config", "lovelace/config/save",
+    } | {f"{domain}/{op}" for domain in HELPER_DOMAINS for op in ("list", "update")}
 
     if request.get("type") not in allowed_commands:
         raise ValueError(
@@ -831,7 +832,7 @@ def store_change(record):
             temporary.unlink(missing_ok=True)
 
 
-def load_change(change_id):
+def load_change(change_id, resource="automation"):
     if not re.fullmatch(
         r"[a-f0-9]{32}",
         change_id,
@@ -871,6 +872,9 @@ def load_change(change_id):
             "Unexpected proposal status"
         )
 
+    if record.get("resource", "automation") != resource:
+        raise ValueError("Wrong proposal resource type")
+
     original = record.get("original_config")
     proposed = record.get("proposed_config")
 
@@ -909,6 +913,7 @@ def create_change_record(
 ):
     return {
         "schema_version": 1,
+        "write_version": 4,
         "change_id": secrets.token_hex(16),
         "automation_id": automation_id,
         "alias": original.get("alias"),
@@ -1040,7 +1045,7 @@ def review_automation_change(
     proposed = record["proposed_config"]
 
     result = {
-        "status": "prepared_only",
+        "status": "approval_consumed" if approval_used(record) else "prepared_only",
         "change_id": change_id,
         "automation_id": record["automation_id"],
         "alias": record.get("alias"),
@@ -1078,6 +1083,8 @@ def review_automation_change(
             != record["original_fingerprint"]
         )
 
+        result["live_configuration_modified"] = current_hash != record["original_fingerprint"]
+        result["matches_proposal"] = current_hash == record["proposed_fingerprint"]
         result["live_check_completed"] = True
 
     except Exception:
@@ -1093,115 +1100,17 @@ def review_automation_change(
 
 # --------------------------------------------------
 # CONTROLLED EDITING
-# Version 0.3.0: restricted to the test automation.
+# Version 0.4.0: existing automation editing.
 # --------------------------------------------------
 
 
-def check_test_automation(automation_id):
-    if automation_id != TEST_AUTOMATION_ID:
-        raise PermissionError(
-            "Editing is restricted to MCP Editing Test"
-        )
-
-
-def check_test_config(config):
-    if str(config.get("id")) != TEST_AUTOMATION_ID:
-        raise ValueError(
-            "Incorrect test automation ID"
-        )
-
-    if config.get("alias") != "MCP Editing Test":
-        raise ValueError(
-            "Incorrect test automation alias"
-        )
-
-    allowed = {
-        "id",
-        "alias",
-        "description",
-        "triggers",
-        "conditions",
-        "actions",
-        "mode",
-    }
-
-    if set(config) - allowed:
-        raise ValueError(
-            "Unexpected test configuration fields"
-        )
-
-    description = config.get("description", "")
-
-    if not isinstance(description, str):
-        raise ValueError(
-            "Description must be text"
-        )
-
-    if config.get("triggers") != [
-        {
-            "trigger": "event",
-            "event_type": "mcp_editing_test",
-        }
-    ]:
-        raise ValueError(
-            "Test trigger cannot be changed"
-        )
-
-    if config.get("conditions", []) != []:
-        raise ValueError(
-            "Test conditions cannot be changed"
-        )
-
-    if config.get("mode") != "single":
-        raise ValueError(
-            "Test automation must use single mode"
-        )
-
-    actions = config.get("actions")
-
-    if not isinstance(actions, list) or len(actions) != 1:
-        raise ValueError(
-            "Exactly one delay action is permitted"
-        )
-
-    action = actions[0]
-
-    if not isinstance(action, dict):
-        raise ValueError("Invalid test action")
-
-    if set(action) != {"delay"}:
-        raise ValueError(
-            "Only a delay action is permitted"
-        )
-
-    delay = action["delay"]
-
-    if not isinstance(delay, dict):
-        raise ValueError(
-            "Delay must be an object"
-        )
-
-    if set(delay) != {"seconds"}:
-        raise ValueError(
-            "Delay must be expressed in seconds"
-        )
-
-    seconds = delay["seconds"]
-
-    if type(seconds) is not int or not 1 <= seconds <= 10:
-        raise ValueError(
-            "Delay must be between 1 and 10 seconds"
-        )
-
-
 def native_validate(config):
-    check_test_config(config)
 
     result = websocket_request({
         "type": "validate_config",
-        "triggers": config.get("triggers", []),
-        "conditions": config.get("conditions", []),
-        "actions": config.get("actions", []),
+        "triggers": config.get("triggers", config.get("trigger", [])),
+        "conditions": config.get("conditions", config.get("condition", [])),
+        "actions": config.get("actions", config.get("action", [])),
     })
 
     if not isinstance(result, dict):
@@ -1259,6 +1168,8 @@ def approval_used(record):
 
 
 def check_approval(record):
+    if record.get("write_version") != 4:
+        raise PermissionError("Prepare a new proposal under version 0.4.0")
     if approval_used(record):
         raise PermissionError(
             "This approval has already been consumed"
@@ -1380,8 +1291,6 @@ def save_native_config(
     automation_id,
     config,
 ):
-    check_test_automation(automation_id)
-    check_test_config(config)
 
     token = supervisor_token()
 
@@ -1439,7 +1348,7 @@ def validate_automation_change(
     change_id: str,
 ) -> dict:
     """
-    Validate a prepared test automation change.
+    Validate a prepared automation change.
 
     Uses native Home Assistant WebSocket validation.
     Returns an independent approval reference.
@@ -1449,13 +1358,9 @@ def validate_automation_change(
 
     record = load_change(change_id)
 
-    check_test_automation(
-        record["automation_id"]
-    )
 
     proposed = record["proposed_config"]
 
-    check_test_config(proposed)
 
     if approval_used(record):
         raise PermissionError(
@@ -1471,7 +1376,6 @@ def validate_automation_change(
         record["automation_id"]
     )
 
-    check_test_config(current)
 
     if config_fingerprint(current) != record[
         "original_fingerprint"
@@ -1506,7 +1410,7 @@ def apply_automation_change(
     """
     Apply an independently approved test automation change.
 
-    Restricted to MCP Editing Test.
+    Supports existing automations.
 
     Requires matching approval in Home Assistant app
     configuration. Approval is single-use and expires
@@ -1523,11 +1427,9 @@ def apply_automation_change(
 
         automation_id = record["automation_id"]
 
-        check_test_automation(automation_id)
 
         proposed = record["proposed_config"]
 
-        check_test_config(proposed)
         check_approval(record)
 
         validation = native_validate(proposed)
@@ -1536,7 +1438,6 @@ def apply_automation_change(
             automation_id
         )
 
-        check_test_config(current)
 
         if config_fingerprint(current) != record[
             "original_fingerprint"
@@ -1616,7 +1517,7 @@ def prepare_automation_rollback(
     change_id: str,
 ) -> dict:
     """
-    Prepare restoration of an original test configuration.
+    Prepare restoration of an original configuration.
 
     Does not apply the rollback.
 
@@ -1629,20 +1530,17 @@ def prepare_automation_rollback(
 
         automation_id = previous["automation_id"]
 
-        check_test_automation(automation_id)
 
         current = get_automation_config(
             automation_id
         )
 
-        check_test_config(current)
 
         original = validate_proposed_config(
             automation_id,
             previous["original_config"],
         )
 
-        check_test_config(original)
 
         current_hash = config_fingerprint(
             current
@@ -1685,6 +1583,120 @@ def prepare_automation_rollback(
             "live_configuration_modified": False,
             "diff": record["diff"],
         }
+
+
+@mcp.tool()
+def list_native_dashboards() -> list:
+    """List dashboards using the native Lovelace API."""
+    return websocket_request({"type": "lovelace/dashboards/list"})
+
+@mcp.tool()
+def list_native_helpers(domain: str) -> list:
+    """List storage-managed helpers in a supported domain."""
+    if domain not in HELPER_DOMAINS:
+        raise ValueError("Unsupported helper domain: " + domain)
+    return websocket_request({"type": domain + "/list"})
+
+@mcp.tool()
+def get_managed_config(resource: str, target: str) -> dict:
+    """Read a storage dashboard by URL path (empty for default), or helper by domain/id."""
+    if resource == "dashboard":
+        request = {"type": "lovelace/config", "force": True}
+        if target:
+            request["url_path"] = target
+        result = websocket_request(request)
+    elif resource == "helper":
+        domain, sep, item_id = target.partition("/")
+        if not sep or not item_id:
+            raise ValueError("Use domain/id")
+        matches = [x for x in list_native_helpers(domain) if x.get("id") == item_id]
+        if len(matches) != 1:
+            raise ValueError("Helper not found or ambiguous")
+        result = matches[0]
+    else:
+        raise ValueError("Use dashboard or helper")
+    if not isinstance(result, dict):
+        raise ValueError("No editable configuration returned")
+    return result
+
+@mcp.tool()
+def prepare_managed_change(resource: str, target: str, proposed_config: dict, reason: str) -> dict:
+    """Prepare replacement of an existing storage dashboard or helper. No live writes."""
+    if not reason.strip() or len(reason) > 2000:
+        raise ValueError("Provide a reason")
+    original = get_managed_config(resource, target)
+    if len(canonical_config(proposed_config)) > MAX_CONFIG_BYTES:
+        raise ValueError("Configuration too large")
+    if resource == "dashboard":
+        if not isinstance(proposed_config.get("views"), list):
+            raise ValueError("Dashboard must contain a views list")
+    elif resource == "helper":
+        if proposed_config.get("id") != original.get("id") or set(proposed_config) != set(original):
+            raise ValueError("Preserve helper ID and existing field set")
+    if original == proposed_config:
+        return {"status": "no_changes"}
+    record = create_change_record(target, original, proposed_config, reason)
+    record["resource"] = resource
+    store_change(record)
+    return {"change_id": record["change_id"], "resource": resource, "target": target,
+            "diff": record["diff"], "approval_reference": approval_reference(record),
+            "approval_expires_at": approval_expiry(record).isoformat(),
+            "native_validation_performed": False, "live_configuration_modified": False}
+
+@mcp.tool()
+def review_managed_change(resource: str, change_id: str) -> dict:
+    """Review a dashboard or helper proposal and current configuration."""
+    if resource not in {"dashboard", "helper"}:
+        raise ValueError("Unsupported resource")
+    r = load_change(change_id, resource)
+    current = get_managed_config(resource, r["automation_id"])
+    return {**r, "approval_consumed": approval_used(r),
+            "matches_original": config_fingerprint(current) == r["original_fingerprint"],
+            "matches_proposal": config_fingerprint(current) == r["proposed_fingerprint"]}
+
+@mcp.tool()
+def apply_managed_change(resource: str, change_id: str) -> dict:
+    """Apply approved storage dashboard/helper edit. Native save validates supported fields."""
+    if resource not in {"dashboard", "helper"}:
+        raise ValueError("Unsupported resource")
+    with EDIT_LOCK:
+        r = load_change(change_id, resource)
+        check_approval(r)
+        target = r["automation_id"]
+        proposed = r["proposed_config"]
+        current = get_managed_config(resource, target)
+        if config_fingerprint(current) != r["original_fingerprint"]:
+            raise RuntimeError("Configuration conflict")
+        if resource == "dashboard":
+            request = {"type": "lovelace/config/save", "config": proposed}
+            if target:
+                request["url_path"] = target
+        else:
+            domain, _, item_id = target.partition("/")
+            if domain not in HELPER_DOMAINS or proposed.get("id") != item_id:
+                raise ValueError("Invalid helper target")
+            request = {"type": domain + "/update", domain + "_id": item_id}
+            request.update({k: v for k, v in proposed.items() if k != "id" and current.get(k) != v})
+        check_approval(r)
+        consume_approval(r)
+        try:
+            websocket_request(request)
+            actual = get_managed_config(resource, target)
+        except Exception as exc:
+            return {"status": "save_outcome_uncertain", "approval_consumed": True, "error": str(exc)}
+        verified = config_fingerprint(actual) == r["proposed_fingerprint"]
+        return {"status": "saved_and_verified" if verified else "verification_mismatch", "actual_config": actual, "approval_consumed": True}
+
+@mcp.tool()
+def prepare_managed_rollback(resource: str, change_id: str) -> dict:
+    """Prepare separately approved restoration of a dashboard or helper."""
+    if resource not in {"dashboard", "helper"}:
+        raise ValueError("Unsupported resource")
+    r = load_change(change_id, resource)
+    current = get_managed_config(resource, r["automation_id"])
+    if config_fingerprint(current) != r["proposed_fingerprint"]:
+        raise RuntimeError("Rollback conflict")
+    return prepare_managed_change(resource, r["automation_id"], r["original_config"], "Restore " + change_id)
 
 
 class TokenMiddleware(BaseHTTPMiddleware):
